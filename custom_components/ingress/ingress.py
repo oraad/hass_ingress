@@ -13,6 +13,7 @@ from urllib.parse import urlencode, quote
 from yarl import URL
 
 from .const import DOMAIN, LOGGER as _LOGGER, API_BASE, URL_BASE, WorkMode, UIMode, RewriteMode
+from .http import MIN_COMPRESSED_SIZE, should_compress
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -36,6 +37,7 @@ METH_ALLOW_REDIRECT = (hdrs.METH_GET, hdrs.METH_HEAD)
 INIT_HEADERS_FILTER = {
     hdrs.CONTENT_LENGTH,
     hdrs.CONTENT_ENCODING,
+    hdrs.ACCEPT_ENCODING,  # Avoid local compression, as we will compress at the border
     hdrs.TRANSFER_ENCODING,
     hdrs.SEC_WEBSOCKET_EXTENSIONS,
     hdrs.SEC_WEBSOCKET_PROTOCOL,
@@ -306,19 +308,38 @@ document.querySelector("ha-panel-ingress").setProperties({{panel: {{
                         rewrite_body = _make_rewrite(rule, rewrite_body)
 
             headers = CIMultiDict((k, v) for k, vs in headers.items() for v in vs if v)
-            # Simple request
-            if rewrite_body or must_be_empty_body(request.method, result.status):
-                # Return Response
+
+            if must_be_empty_body(request.method, result.status):
+                if ctype != "application/octet-stream":
+                    headers[hdrs.CONTENT_TYPE] = ctype
+                return web.Response(headers=headers, status=result.status)
+
+            content_length = result.headers.get(hdrs.CONTENT_LENGTH)
+            use_buffered = rewrite_body is not None or (
+                content_length is not None
+                and int(content_length) <= MAX_SIMPLE_REQUEST_SIZE
+            )
+            if use_buffered:
                 body = await result.read()
                 if rewrite_body:
                     body = rewrite_body(body)
-                return web.Response(
-                    headers=headers, status=result.status, content_type=ctype, body=body
+                simple_response = web.Response(
+                    headers=headers,
+                    status=result.status,
+                    content_type=ctype,
+                    body=body,
+                    zlib_executor_size=32768,
                 )
+                body_len = len(body)
+                if body_len > MIN_COMPRESSED_SIZE and should_compress(ctype):
+                    simple_response.enable_compression()
+                return simple_response
 
             # Stream response
             response = web.StreamResponse(status=result.status, headers=headers)
             response.content_type = ctype
+            if should_compress(ctype):
+                response.enable_compression()
 
             try:
                 await response.prepare(request)
